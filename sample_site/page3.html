@@ -7,10 +7,15 @@
 <body>
   <h1>实验耗材供应商 · 滤膜目录（第 3 页 / 共 3 页）</h1>
   <ul class="product-list">
+    <!-- 与第 2 页完全重复的原始链接：跨页重复出现，只应计一次 -->
     <li class="product-item">
-      <a class="product-link" href="details/mf50-25.html">MCE 微孔滤膜 MF-50 0.45μm 50mm（25片/包 试用装）</a>
+      <a class="product-link" href="details/mf50-100.html">MCE 微孔滤膜 MF-50 0.45μm 50mm（100片/包 经济装）</a>
     </li>
-    <!-- 故意失效的详情链接：用于演示"匹配详情抓取失败"场景 -->
+    <!-- 失效别名：标注 CA-22 的链接跳转到不存在的详情页，不得当作已去重商品忽略 -->
+    <li class="product-item">
+      <a class="product-link" href="details/ca-22-alias-broken.html">醋酸纤维素滤膜 CA-22 0.22μm 13mm（200片/包 迁移别名）</a>
+    </li>
+    <!-- 直接失效的详情链接：用于演示"匹配详情抓取失败"场景 -->
     <li class="product-item">
       <a class="product-link" href="details/broken-404.html">实验滤膜 BROKEN-1（演示抓取失败的商品）</a>
     </li>

@@ -2,15 +2,17 @@
 
 抓取流程：
 1. 从目录列表页出发，沿"下一页"链接在同站内翻页（去重、限页数）；
-2. 收集列表中的详情链接，同一详情 URL 跨页重复出现只计一次；
-3. 按型号筛选匹配的详情页并抓取，解析每包片数、含税包价、可购包数；
-4. 匹配到的详情页抓取或解析失败时记录到 failed_details（调用方据此
-   不给出确定最低价）。
+2. 收集列表中的详情链接（原始链接 URL 去重），并按列表文案初筛目标型号；
+3. 逐个抓取详情链接，跟随 HTTP 重定向与同站 HTML meta refresh 跳转，
+   以**跳转后的实际详情地址**作为包装的唯一标识——同一包装的旧/新链接
+   只纳入一次价格与库存；
+4. 列表文案已确认匹配目标型号的链接，若跳转或抓取/解析失败，记录到
+   failed_details（调用方据此不给出确定最低价），不会被当作已去重商品忽略。
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import urljoin, urlparse, urldefrag
 
@@ -18,6 +20,7 @@ import requests
 from bs4 import BeautifulSoup
 
 MAX_PAGES = 50          # 分页抓取上限，防止死循环或异常站点
+MAX_REDIRECT_HOPS = 10  # 单条详情链接的最大跳转次数（HTTP 重定向 + meta refresh）
 REQUEST_TIMEOUT = 10    # 单次请求超时（秒）
 USER_AGENT = "membrane-procurement-bot/1.0"
 
@@ -29,6 +32,10 @@ PRODUCT_LINK_SELECTORS = [
 ]
 NEXT_TEXT_RE = re.compile(r"(下一页|下页|next|»|›)", re.I)
 NUM_RE = re.compile(r"([\d,]+(?:\.\d+)?)")
+META_REFRESH_RE = re.compile(
+    r"""^\s*\d+\s*;\s*url\s*=\s*(?P<quote>["']?)(?P<url>.*?)(?P=quote)\s*$""",
+    re.I,
+)
 
 
 class ScrapeError(Exception):
@@ -39,21 +46,31 @@ class ScrapeError(Exception):
 class OfferInfo:
     """一个匹配详情页解析出的采购信息。"""
 
-    detail_url: str
+    detail_url: str                       # 跳转后的实际详情地址（包装唯一标识）
     title: str
     model: str
-    pack_size: int    # 每包片数
-    price_fen: int    # 含税包价（分）
-    stock_packs: int  # 可购包数
+    pack_size: int                        # 每包片数
+    price_fen: int                        # 含税包价（分）
+    stock_packs: int                      # 可购包数
+    source_link_urls: list[str] = field(default_factory=list)  # 指向本包装的目录原始链接
+
+
+@dataclass
+class AliasInfo:
+    """一条指向同一详情页的别名（旧/新）链接。"""
+
+    source_link_url: str   # 目录中出现的原始链接 URL
+    final_detail_url: str  # 跳转后的实际详情地址
 
 
 @dataclass
 class CrawlResult:
     list_pages: list[str]           # 实际抓取到的列表页 URL（按顺序）
-    matched: list[OfferInfo]        # 匹配型号且解析成功的详情
-    failed_details: list[str]       # 匹配但抓取/解析失败的详情 URL
-    duplicate_details: int          # 跨页重复出现被跳过的详情链接数
-    unverified_failed: list[str]    # 兜底扫描时无法抓取、未能核对型号的详情 URL
+    matched: list[OfferInfo]        # 匹配型号且解析成功的详情（按最终 URL 去重）
+    failed_details: list[str]       # 匹配但跳转/抓取/解析失败的原始链接 URL
+    duplicate_details: int          # 列表中原始链接完全重复被跳过的次数
+    alias_details: list[AliasInfo]  # 跳转后落到同一详情页的别名链接
+    unverified_failed: list[str]    # 兜底扫描时无法抓取、未能核对型号的链接 URL
 
 
 def normalize_model(text: str) -> str:
@@ -65,18 +82,64 @@ def _abs_url(href: str, base: str) -> str:
     return urldefrag(urljoin(base, href))[0]
 
 
+def _canonical_url(url: str) -> str:
+    """统一 URL 形态：去 fragment，空路径补 "/"，使同一页面始终得到同一标识。"""
+    url = urldefrag(url)[0]
+    parts = urlparse(url)
+    path = parts.path or "/"
+    return parts._replace(path=path).geturl()
+
+
 def _same_site(url: str, netloc: str) -> bool:
     return urlparse(url).netloc == netloc
 
 
-def _get_soup(session: requests.Session, url: str) -> BeautifulSoup:
+def _get(session: requests.Session, url: str) -> requests.Response:
     try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT)
+        resp = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
         resp.raise_for_status()
     except requests.RequestException as exc:
         raise ScrapeError(f"页面抓取失败 {url}: {exc}") from exc
+    return resp
+
+
+def _get_soup(session: requests.Session, url: str) -> BeautifulSoup:
+    resp = _get(session, url)
     # 用原始字节交给 BeautifulSoup，按页面 <meta charset> 自动识别编码
     return BeautifulSoup(resp.content, "html.parser")
+
+
+def _meta_refresh_target(soup: BeautifulSoup, current_url: str, netloc: str) -> str | None:
+    """解析 HTML <meta http-equiv="refresh" content="0; url=...">，只接受同站跳转。"""
+    for meta in soup.find_all("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)}):
+        content = meta.get("content") or ""
+        m = META_REFRESH_RE.match(content)
+        if not m:
+            continue
+        target = _abs_url(m.group("url").strip(), current_url)
+        if target != current_url and _same_site(target, netloc):
+            return target
+    return None
+
+
+def fetch_final_detail(session: requests.Session, start_url: str, netloc: str) -> tuple[str, BeautifulSoup]:
+    """跟随 HTTP 重定向与同站 meta refresh 跳转，返回 (最终详情 URL, 详情页 soup)。
+
+    任一跳转或抓取失败均抛 ScrapeError（调用方保留的是原始链接 URL）。
+    """
+    url = start_url
+    hops = 0
+    while True:
+        resp = _get(session, url)  # requests 默认跟随 HTTP 3xx 重定向
+        final_url = _canonical_url(resp.url)
+        soup = BeautifulSoup(resp.content, "html.parser")
+        target = _meta_refresh_target(soup, final_url, netloc)
+        if target is None:
+            return final_url, soup
+        hops += 1
+        if hops > MAX_REDIRECT_HOPS:
+            raise ScrapeError(f"页面跳转次数超过上限 {MAX_REDIRECT_HOPS}: {start_url}")
+        url = target
 
 
 def _product_links(soup: BeautifulSoup):
@@ -186,8 +249,10 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
     target = normalize_model(model)
 
     list_pages: list[str] = []
-    entries: list[tuple[str, str]] = []  # (详情 URL, 列表文案)
-    seen_details: set[str] = set()
+    entries: list[tuple[str, str]] = []  # (详情原始链接 URL, 列表文案)
+    seen_links: set[str] = set()
+    # 每条原始链接在目录中出现过的所有 URL（完全重复时不再抓取，但仍计入真实来源）
+    link_occurrences: dict[str, list[str]] = {}
     duplicates = 0
 
     url: str | None = catalog_url
@@ -200,14 +265,16 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
             href = a.get("href")
             if not href:
                 continue
-            detail_url = _abs_url(href, url)
-            if not _same_site(detail_url, netloc):
+            link_url = _canonical_url(_abs_url(href, url))
+            if not _same_site(link_url, netloc):
                 continue  # 只接受同站详情链接
-            if detail_url in seen_details:
-                duplicates += 1  # 同一详情跨页重复出现，只计一次
+            if link_url in seen_links:
+                duplicates += 1  # 原始链接完全重复，先跳过；失败的链接不会在此阶段被吞掉
+                link_occurrences[link_url].append(link_url)
                 continue
-            seen_details.add(detail_url)
-            entries.append((detail_url, a.get_text(" ", strip=True)))
+            seen_links.add(link_url)
+            link_occurrences[link_url] = [link_url]
+            entries.append((link_url, a.get_text(" ", strip=True)))
         url = _next_page_url(soup, url, netloc)
 
     # 先用列表文案匹配型号；若一个都匹配不上，退回逐个抓取详情页核对型号
@@ -216,28 +283,57 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
     candidates = entries if fallback_scan else matched_entries
 
     matched: list[OfferInfo] = []
+    offers_by_url: dict[str, OfferInfo] = {}
     failed: list[str] = []
     unverified: list[str] = []
-    for detail_url, _text in candidates:
-        try:
-            soup = _get_soup(session, detail_url)
-            offer = parse_detail_page(detail_url, soup)
-        except ScrapeError:
-            if fallback_scan:
-                # 兜底扫描时无法确认该页是否匹配，单独记录为"未能核对"
-                unverified.append(detail_url)
+    aliases: list[AliasInfo] = []
+
+    try:
+        for link_url, _text in candidates:
+            try:
+                # 关键：以跳转后的实际详情地址识别包装，而非目录里的原始链接
+                final_url, soup = fetch_final_detail(session, link_url, netloc)
+                offer = parse_detail_page(final_url, soup)
+            except ScrapeError:
+                if fallback_scan:
+                    # 兜底扫描时无法确认该页是否匹配，单独记录为"未能核对"
+                    unverified.append(link_url)
+                else:
+                    # 列表文案已确认匹配的链接跳转/抓取/解析失败：
+                    # 必须如实上报，不能当作已去重商品忽略，也不能给确定最低价
+                    failed.append(link_url)
+                continue
+
+            # 列表文案匹配但详情型号不符的，视为非目标商品，静默跳过
+            if target not in normalize_model(offer.model) and target not in normalize_model(offer.title):
+                continue
+
+            existing = offers_by_url.get(final_url)
+            is_alias = link_url != final_url  # 原始链接经跳转才到实际详情页 → 别名入口
+            if existing is None:
+                offer.detail_url = final_url
+                # 真实来源包含该链接在目录中的全部出现（含跨页完全重复的原始链接）
+                offer.source_link_urls = list(link_occurrences.get(link_url, [link_url]))
+                offers_by_url[final_url] = offer
+                matched.append(offer)
             else:
-                # 列表文案已确认匹配的详情抓取/解析失败：无法保证最低价确定性
-                failed.append(detail_url)
-            continue
-        if target in normalize_model(offer.model) or target in normalize_model(offer.title):
-            matched.append(offer)
-        # 列表文案匹配但详情型号不符的，视为非目标商品，静默跳过
+                # 旧/新链接跳到同一详情页：同一包装只纳入一次价格与库存
+                existing.source_link_urls.extend(link_occurrences.get(link_url, [link_url]))
+            if is_alias:
+                # 别名记录与是否首次出现无关：每个跳转入口都如实登记
+                aliases.append(AliasInfo(source_link_url=link_url, final_detail_url=final_url))
+    finally:
+        session.close()
+
+    for offer in matched:
+        # 去重但保留首次出现顺序，作为该包装在目录中的真实来源清单
+        offer.source_link_urls = list(dict.fromkeys(offer.source_link_urls))
 
     return CrawlResult(
         list_pages=list_pages,
         matched=matched,
         failed_details=failed,
         duplicate_details=duplicates,
+        alias_details=aliases,
         unverified_failed=unverified,
     )

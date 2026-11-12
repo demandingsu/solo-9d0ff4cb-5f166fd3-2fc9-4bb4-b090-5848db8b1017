@@ -17,8 +17,21 @@ from main import app  # noqa: E402
 SITE_DIR = ROOT / "sample_site"
 
 
-def start_site_server() -> tuple[http.server.ThreadingHTTPServer, str]:
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(SITE_DIR))
+class RedirectHandler(http.server.SimpleHTTPRequestHandler):
+    """演示真实 HTTP 302 重定向：old-302.html 跳转到 canonical.html。"""
+
+    def do_GET(self):  # noqa: N802 - http.server 约定命名
+        if self.path.endswith("/old-302.html"):
+            target = self.path.replace("old-302.html", "canonical.html")
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.end_headers()
+            return
+        super().do_GET()
+
+
+def make_server(directory: str, handler_cls=http.server.SimpleHTTPRequestHandler):
+    handler = functools.partial(handler_cls, directory=directory)
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -31,120 +44,177 @@ def check(name: str, cond: bool, extra: str = ""):
 
 
 def main():
-    httpd, base = start_site_server()
+    httpd, base = make_server(str(SITE_DIR))
     client = TestClient(app)
     catalog = f"{base}/index.html"
     print(f"样本站: {catalog}")
 
-    # 1) 正常求解：MF-50 需求 180 → 2 包 100 片装，¥450
-    r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "MF-50", "demand": 180})
+    # 1) 核心场景：旧/新链接跳转到同一 100 片装（仅剩 1 包），需求 200 → 库存不足
+    r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "MF-50", "demand": 200})
     assert r.status_code == 200, r.text
     d = r.json()
-    check("MF-50/180 状态 ok", d["status"] == "ok")
-    check("总价 ¥450.00", d["solution"]["total_price"] == "450.00")
-    check("实到 200 片", d["solution"]["total_pieces"] == 200)
-    check("超量 20 片", d["solution"]["overage"] == 20)
-    items = d["solution"]["items"]
-    check("仅一种包装", len(items) == 1)
-    check("100片装 ×2", items[0]["pack_size"] == 100 and items[0]["purchased_packs"] == 2)
-    check("详情来源 URL", items[0]["detail_url"].endswith("/details/mf50-100.html"))
+    check("MF-50/200 状态 insufficient_stock", d["status"] == "insufficient_stock", d["status"])
+    check("无方案、无确定最低价", d["solution"] is None)
+    check("库存只算一次：可购总量 100 片", d["total_available_pieces"] == 100, str(d.get("total_available_pieces")))
 
-    # 2) 分页与跨页去重：3 个列表页都被抓取，mf50-50 只计一次
+    # 2) 同一包装按跳转后的实际详情地址只识别一次
+    check("匹配详情仅 1 个（100 片装）", len(d["matched_detail_pages"]) == 1, str(d["matched_detail_pages"]))
+    check(
+        "匹配详情为跳转后的实际地址",
+        d["matched_detail_pages"][0].endswith("/details/mf50-100.html"),
+        d["matched_detail_pages"][0],
+    )
+
+    # 3) 别名与跨页原始链接重复的计数
     check("抓取 3 个列表页", len(d["list_pages"]) == 3, str(d["list_pages"]))
-    check("跨页重复跳过 1 次", d["duplicate_detail_links_skipped"] == 1)
-    check("匹配详情 3 个", len(d["matched_detail_pages"]) == 3, str(d["matched_detail_pages"]))
+    check("跨页原始链接重复跳过 1 次", d["duplicate_detail_links_skipped"] == 1)
+    check("识别出 2 条别名链接", len(d["alias_detail_links"]) == 2, str(d["alias_detail_links"]))
+    alias_sources = {a["source_link_url"].rsplit("/", 1)[-1] for a in d["alias_detail_links"]}
+    check(
+        "别名来源为旧链接与新别名",
+        alias_sources == {"mf50-100-old.html", "mf50-100-alias.html"},
+        str(alias_sources),
+    )
+    check(
+        "别名均落到 mf50-100.html",
+        all(a["final_detail_url"].endswith("/details/mf50-100.html") for a in d["alias_detail_links"]),
+    )
 
-    # 3) 混购 + 库存约束：需求 175 → 100+50+25 各 1 包，¥413
-    r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "MF-50", "demand": 175})
+    # 4) 需求 100：恰好买这唯一一包，报价明细给出真实来源（全部原始链接）
+    r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "MF-50", "demand": 100})
     d = r.json()
-    check("MF-50/175 状态 ok", d["status"] == "ok")
-    check("混购 3 种包装", len(d["solution"]["items"]) == 3)
-    check("总价 ¥413.00", d["solution"]["total_price"] == "413.00")
-    check("实到 175 片（零超量）", d["solution"]["total_pieces"] == 175 and d["solution"]["overage"] == 0)
+    check("MF-50/100 状态 ok", d["status"] == "ok", d.get("message", ""))
+    items = d["solution"]["items"]
+    check("仅一种包装、采购 1 包", len(items) == 1 and items[0]["purchased_packs"] == 1)
+    check("总价 ¥225.00", d["solution"]["total_price"] == "225.00")
+    check("实到 100 片、零超量", d["solution"]["total_pieces"] == 100 and d["solution"]["overage"] == 0)
+    check("来源为实际详情地址", items[0]["detail_url"].endswith("/details/mf50-100.html"))
+    source_names = sorted(u.rsplit("/", 1)[-1] for u in items[0]["catalog_link_urls"])
+    check(
+        "明细给出全部真实来源链接",
+        source_names == ["mf50-100-alias.html", "mf50-100-old.html", "mf50-100.html"],
+        str(source_names),
+    )
 
-    # 4) 库存上限：需求 1000 → 恰好买光 10 包 100 片装
-    r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "MF-50", "demand": 1000})
+    # 5) 失效别名（标注 CA-22 的链接跳转后 404）：不得当作已去重商品忽略
+    r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "CA-22", "demand": 200})
     d = r.json()
-    check("MF-50/1000 状态 ok", d["status"] == "ok")
-    check("总价 ¥2250.00", d["solution"]["total_price"] == "2250.00")
-    check("实到 1000 片", d["solution"]["total_pieces"] == 1000)
+    check("CA-22/200 状态 scrape_failed", d["status"] == "scrape_failed", d["status"])
+    check("无方案、无确定最低价", d["solution"] is None)
+    check(
+        "上报失效别名原始链接",
+        any(u.endswith("/details/ca-22-alias-broken.html") for u in d["failed_detail_pages"]),
+        str(d["failed_detail_pages"]),
+    )
 
-    # 5) 库存不足：需求 4000 > 可购总量 3750 → 不给确定最低价
-    r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "MF-50", "demand": 4000})
-    d = r.json()
-    check("MF-50/4000 状态 insufficient_stock", d["status"] == "insufficient_stock")
-    check("无方案、无总价", d["solution"] is None)
-    check("报告可购总量 3750", d["total_available_pieces"] == 3750)
-
-    # 6) 匹配详情抓取失败：BROKEN-1 的详情页 404 → 不给确定最低价
+    # 6) 直接失效的详情链接（BROKEN-1 404）→ 不给确定最低价
     r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "BROKEN-1", "demand": 10})
     d = r.json()
     check("BROKEN-1 状态 scrape_failed", d["status"] == "scrape_failed")
     check("无方案", d["solution"] is None)
     check("报告失败详情页", d["failed_detail_pages"][0].endswith("/details/broken-404.html"))
 
-    # 7) 无匹配型号（兜底扫描时 broken-404 无法核对，应在响应中如实标注）
+    # 7) 无匹配型号：兜底扫描时失效页无法核对，应在响应中如实标注
     r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "NOPE-9", "demand": 10})
     d = r.json()
     check("NOPE-9 状态 no_matching_products", d["status"] == "no_matching_products")
     check("无方案", d["solution"] is None)
+    unverified = d.get("unverified_failed_pages", [])
     check(
-        "标注未能核对的页面",
-        any(u.endswith("/details/broken-404.html") for u in d.get("unverified_failed_pages", [])),
+        "标注未能核对的失效页面",
+        {u.rsplit("/", 1)[-1] for u in unverified}
+        == {"ca-22-alias-broken.html", "broken-404.html"},
+        str(unverified),
     )
 
     # 8) 其他型号正常匹配：NY-66 需求 150 → 2 包 100 片装 ¥360
     r = client.post("/api/v1/quote", json={"catalog_url": catalog, "model": "NY-66", "demand": 150})
     d = r.json()
-    check("NY-66/150 状态 ok", d["status"] == "ok")
+    check("NY-66/150 状态 ok", d["status"] == "ok", d.get("message", ""))
     check("总价 ¥360.00", d["solution"]["total_price"] == "360.00")
+    check("采购 2 包", d["solution"]["items"][0]["purchased_packs"] == 2)
 
     # 9) 目录不可达
     r = client.post("/api/v1/quote", json={"catalog_url": f"{base}/no-such-page.html", "model": "MF-50", "demand": 10})
     d = r.json()
     check("目录不存在状态 catalog_unreachable", d["status"] == "catalog_unreachable")
 
-    # 10) 兜底扫描语义：列表文案不含型号时逐个核对详情页
+    # 10) 真实 HTTP 302 重定向：同一包装的两个入口按最终 URL 去重
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = pathlib.Path(tmp)
         (tmp_path / "details").mkdir()
         (tmp_path / "index.html").write_text(
             '<html><body><ul class="product-list">'
-            '<li class="product-item"><a class="product-link" href="details/d1.html">特价滤膜 甲</a></li>'
-            '<li class="product-item"><a class="product-link" href="details/d2.html">特价滤膜 乙</a></li>'
+            '<li class="product-item"><a class="product-link" href="details/old-302.html">'
+            'MCE 微孔滤膜 RED-1（100片/包 旧链接）</a></li>'
+            '<li class="product-item"><a class="product-link" href="details/canonical.html">'
+            'MCE 微孔滤膜 RED-1（100片/包 现行链接）</a></li>'
             "</ul></body></html>",
             encoding="utf-8",
         )
-        (tmp_path / "details" / "d1.html").write_text(
-            '<html><body><h1 class="product-title">特价滤膜 甲</h1>'
-            '<table><tr><td class="product-model">FALL-1</td>'
-            '<td class="pack-size">40</td>'
-            '<td class="pack-price">¥90.00</td>'
-            '<td class="stock-packs">8</td></tr></table></body></html>',
+        detail = (
+            '<html><body><h1 class="product-title">MCE 微孔滤膜 RED-1（100片装）</h1>'
+            '<table><tr><td class="product-model">RED-1</td>'
+            '<td class="pack-size">100</td>'
+            '<td class="pack-price">¥200.00</td>'
+            '<td class="stock-packs">1</td></tr></table></body></html>'
+        )
+        (tmp_path / "details" / "canonical.html").write_text(detail, encoding="utf-8")
+        httpd2, base2 = make_server(tmp, RedirectHandler)
+        cat2 = f"{base2}/index.html"
+
+        r = client.post("/api/v1/quote", json={"catalog_url": cat2, "model": "RED-1", "demand": 200})
+        d = r.json()
+        check("302 去重后库存 100 → 需求 200 不足", d["status"] == "insufficient_stock", d["status"])
+        check("302 后仅识别 canonical 一个包装", len(d["matched_detail_pages"]) == 1)
+        check(
+            "最终地址为 canonical.html",
+            d["matched_detail_pages"][0].endswith("/details/canonical.html"),
+        )
+        check("302 旧链接计入别名", d["alias_detail_links"][0]["source_link_url"].endswith("/details/old-302.html"))
+        httpd2.shutdown()
+        httpd2.server_close()
+
+    # 11) 标有目标型号的失效链接与有效链接并存：失效链接不得被去重吞掉，也不能给确定最低价
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        (tmp_path / "details").mkdir()
+        (tmp_path / "index.html").write_text(
+            '<html><body><ul class="product-list">'
+            '<li class="product-item"><a class="product-link" href="details/good.html">'
+            'MCE 微孔滤膜 GHOST-9（100片/包 在售）</a></li>'
+            '<li class="product-item"><a class="product-link" href="details/ghost.html">'
+            'MCE 微孔滤膜 GHOST-9（100片/包 迁移中）</a></li>'
+            "</ul></body></html>",
             encoding="utf-8",
         )
-        # d2.html 故意不存在（404）
-        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=tmp)
-        httpd2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        threading.Thread(target=httpd2.serve_forever, daemon=True).start()
-        cat2 = f"http://127.0.0.1:{httpd2.server_address[1]}/index.html"
+        (tmp_path / "details" / "good.html").write_text(
+            '<html><body><h1 class="product-title">MCE 微孔滤膜 GHOST-9（100片装）</h1>'
+            '<table><tr><td class="product-model">GHOST-9</td>'
+            '<td class="pack-size">100</td>'
+            '<td class="pack-price">¥200.00</td>'
+            '<td class="stock-packs">1</td></tr></table></body></html>',
+            encoding="utf-8",
+        )
+        # details/ghost.html 故意不存在（404）
+        httpd3, base3 = make_server(tmp)
+        cat3 = f"{base3}/index.html"
 
-        # 10a) 详情页型号匹配（FALL-1 只在详情页出现）→ 命中，但 d2 未能核对 → 不给确定最低价
-        r = client.post("/api/v1/quote", json={"catalog_url": cat2, "model": "FALL-1", "demand": 40})
+        r = client.post("/api/v1/quote", json={"catalog_url": cat3, "model": "GHOST-9", "demand": 100})
         d = r.json()
-        check("兜底命中但存在未核对页 → scrape_failed", d["status"] == "scrape_failed")
-        check("无方案", d["solution"] is None)
-        check("失败页为 d2", d["failed_detail_pages"][0].endswith("/details/d2.html"))
-
-        # 10b) 全部不匹配 → no_matching_products 并标注未核对页
-        r = client.post("/api/v1/quote", json={"catalog_url": cat2, "model": "ABSENT-7", "demand": 40})
-        d = r.json()
-        check("兜底无匹配 → no_matching_products", d["status"] == "no_matching_products")
-        check("标注未核对页 d2", any(u.endswith("/details/d2.html") for u in d.get("unverified_failed_pages", [])))
-        httpd2.shutdown()
+        check("含失效目标链接 → scrape_failed", d["status"] == "scrape_failed", d["status"])
+        check("不给确定最低价", d["solution"] is None)
+        check(
+            "失效链接按原始 URL 上报",
+            any(u.endswith("/details/ghost.html") for u in d["failed_detail_pages"]),
+            str(d["failed_detail_pages"]),
+        )
+        httpd3.shutdown()
+        httpd3.server_close()
 
     httpd.shutdown()
+    httpd.server_close()
     print("\n全部端到端检查通过 ✓")
 
 

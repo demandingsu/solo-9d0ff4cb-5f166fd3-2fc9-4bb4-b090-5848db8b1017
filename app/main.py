@@ -58,6 +58,14 @@ def quote(req: QuoteRequest):
         "list_pages": crawl.list_pages,
         "matched_detail_pages": [o.detail_url for o in crawl.matched],
         "duplicate_detail_links_skipped": crawl.duplicate_details,
+        # 旧/新链接跳转到同一详情页的别名记录：同一包装只计一次价格与库存
+        "alias_detail_links": [
+            {
+                "source_link_url": a.source_link_url,
+                "final_detail_url": a.final_detail_url,
+            }
+            for a in crawl.alias_details
+        ],
     }
 
     # 匹配详情抓取失败：不给出确定的最低价
@@ -123,6 +131,8 @@ def quote(req: QuoteRequest):
         items.append(
             {
                 "detail_url": info.detail_url,
+                # 真实来源：目录中指向该包装（跳转后同一详情页）的全部原始链接
+                "catalog_link_urls": list(info.source_link_urls),
                 "title": info.title,
                 "model": info.model,
                 "pack_size": info.pack_size,
